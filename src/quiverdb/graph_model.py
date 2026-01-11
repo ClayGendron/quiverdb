@@ -43,11 +43,6 @@ RESERVED_FIELD_NAMES = _get_reserved_field_names()
 # ============ HELPERS ============
 
 
-def _is_table_model(cls: type[SQLModel]) -> bool:
-    """Check if class is a SQLModel table."""
-    return cls.model_config.get("table", False) is True
-
-
 def _validate_reserved_field_names(cls: type) -> None:
     """Ensure class doesn't use reserved SQLModel field names."""
     own_annotations = getattr(cls, "__annotations__", {})
@@ -278,7 +273,7 @@ class GraphModelMetaclass(SQLModelMetaclass):
                 elif "source" in annotations and "target" in annotations:
                     namespace["__tablename__"] = "edges"
 
-            # Auto-configure __mapper_args__ for polymorphic inheritance
+            # Autoconfigure __mapper_args__ for polymorphic inheritance
             # if the table has a 'type' field
             annotations = namespace.get("__annotations__", {})
             if "type" in annotations and "__mapper_args__" not in namespace:
