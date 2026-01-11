@@ -128,22 +128,28 @@ class Graph:
     # --- Validation Helpers ---
 
     def _validate_node(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Validate node data against schema if configured."""
+        """Validate node data against schema if configured.
+
+        Uses the schema's scoped type registry for type dispatch.
+        """
         if self._schema is None or not self._schema.has_node_model:
             return data
         try:
-            validated = self._schema.node_model.model_validate(data)
+            validated = self._schema.validate_node(data)
             return validated.model_dump()
         except Exception as e:
             node_id = data.get("node", "unknown")
             raise ValueError(f"Validation failed for node '{node_id}': {e}") from e
 
     def _validate_edge(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Validate edge data against schema if configured."""
+        """Validate edge data against schema if configured.
+
+        Uses the schema's scoped type registry for type dispatch.
+        """
         if self._schema is None or not self._schema.has_edge_model:
             return data
         try:
-            validated = self._schema.edge_model.model_validate(data)
+            validated = self._schema.validate_edge(data)
             return validated.model_dump()
         except Exception as e:
             source = data.get("source", "unknown")
