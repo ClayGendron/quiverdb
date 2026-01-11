@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import rustworkx
 from rustworkx import PyDiGraph
 
 from .tracker import ChangeTracker
@@ -21,6 +22,10 @@ class Graph:
     Wraps rustworkx.PyDiGraph with a dict-like interface for nodes and edges.
     When a schema is provided, all data is validated against the configured
     GraphModel classes.
+
+    Thread Safety:
+        This class is NOT thread-safe. Use external locking if sharing
+        a Graph instance across threads.
 
     Usage:
         # Typed mode with validation
@@ -50,6 +55,7 @@ class Graph:
         """
         self._graph = PyDiGraph()
         self._node_to_idx: dict[Hashable, int] = {}
+        self._idx_to_node: dict[int, Hashable] = {}
         self._schema = schema
         self.tracker = ChangeTracker()
 
@@ -125,15 +131,26 @@ class Graph:
         """Validate node data against schema if configured."""
         if self._schema is None or not self._schema.has_node_model:
             return data
-        validated = self._schema.node_model.model_validate(data)
-        return validated.model_dump()
+        try:
+            validated = self._schema.node_model.model_validate(data)
+            return validated.model_dump()
+        except Exception as e:
+            node_id = data.get("node", "unknown")
+            raise ValueError(f"Validation failed for node '{node_id}': {e}") from e
 
     def _validate_edge(self, data: dict[str, Any]) -> dict[str, Any]:
         """Validate edge data against schema if configured."""
         if self._schema is None or not self._schema.has_edge_model:
             return data
-        validated = self._schema.edge_model.model_validate(data)
-        return validated.model_dump()
+        try:
+            validated = self._schema.edge_model.model_validate(data)
+            return validated.model_dump()
+        except Exception as e:
+            source = data.get("source", "unknown")
+            target = data.get("target", "unknown")
+            raise ValueError(
+                f"Validation failed for edge '{source}' -> '{target}': {e}"
+            ) from e
 
     # --- Node Operations ---
 
@@ -146,20 +163,37 @@ class Graph:
         Args:
             node: The node identifier.
             **attr: Node attributes to set.
+
+        Raises:
+            ValueError: If node ID is None or not hashable.
         """
+        if node is None:
+            raise ValueError("Node ID cannot be None")
+        try:
+            hash(node)
+        except TypeError as e:
+            raise ValueError(f"Node ID must be hashable: {node!r}") from e
+
         if node in self._node_to_idx:
             idx = self._node_to_idx[node]
-            node_data = {**self._graph[idx], **attr}
+            # Merge existing data with new attributes
+            existing = self._graph[idx]
+            node_data = {"node": node, **existing, **attr}
         else:
             node_data = {"node": node, **attr}
 
+        # Validate with node ID included (for schema validation)
         node_data = self._validate_node(node_data)
 
+        # Store without node ID (it's in the mapping)
+        stored_data = {k: v for k, v in node_data.items() if k != "node"}
+
         if node in self._node_to_idx:
-            self._graph[self._node_to_idx[node]] = node_data
+            self._graph[self._node_to_idx[node]] = stored_data
         else:
-            idx = self._graph.add_node(node_data)
+            idx = self._graph.add_node(stored_data)
             self._node_to_idx[node] = idx
+            self._idx_to_node[idx] = node
 
         self.tracker.track_node_upsert(node, node_data)
 
@@ -186,7 +220,7 @@ class Graph:
             node: The node identifier.
 
         Returns:
-            Dictionary of node attributes.
+            Dictionary of node attributes including the node ID.
 
         Raises:
             KeyError: If node doesn't exist.
@@ -195,7 +229,7 @@ class Graph:
             raise KeyError(f"Node '{node}' not found in graph")
 
         idx = self._node_to_idx[node]
-        return self._graph[idx]
+        return {"node": node, **self._graph[idx]}
 
     def get_node_as_model(self, node: Hashable) -> GraphModel:
         """Get node data as a validated GraphModel instance.
@@ -230,15 +264,16 @@ class Graph:
 
         # Track edge deletions for incident edges
         for predecessor_idx in self._graph.predecessor_indices(idx):
-            predecessor_node = self._graph[predecessor_idx]["node"]
+            predecessor_node = self._idx_to_node[predecessor_idx]
             self.tracker.track_edge_delete(predecessor_node, node)
 
         for successor_idx in self._graph.successor_indices(idx):
-            successor_node = self._graph[successor_idx]["node"]
+            successor_node = self._idx_to_node[successor_idx]
             self.tracker.track_edge_delete(node, successor_node)
 
         self._graph.remove_node(idx)
         del self._node_to_idx[node]
+        del self._idx_to_node[idx]
         self.tracker.track_node_delete(node)
 
     # --- Edge Operations ---
@@ -383,6 +418,185 @@ class Graph:
         tgt_idx = self._node_to_idx[target]
         return self._graph.has_edge(src_idx, tgt_idx)
 
+    # --- Graph Traversal ---
+
+    def successors(self, node: Hashable) -> list[Hashable]:
+        """Get all direct successors (out-neighbors) of a node.
+
+        Args:
+            node: The node identifier.
+
+        Returns:
+            List of successor node identifiers.
+
+        Raises:
+            KeyError: If node doesn't exist.
+        """
+        if node not in self._node_to_idx:
+            raise KeyError(f"Node '{node}' not found in graph")
+        idx = self._node_to_idx[node]
+        return [self._idx_to_node[i] for i in self._graph.successor_indices(idx)]
+
+    def predecessors(self, node: Hashable) -> list[Hashable]:
+        """Get all direct predecessors (in-neighbors) of a node.
+
+        Args:
+            node: The node identifier.
+
+        Returns:
+            List of predecessor node identifiers.
+
+        Raises:
+            KeyError: If node doesn't exist.
+        """
+        if node not in self._node_to_idx:
+            raise KeyError(f"Node '{node}' not found in graph")
+        idx = self._node_to_idx[node]
+        return [self._idx_to_node[i] for i in self._graph.predecessor_indices(idx)]
+
+    def neighbors(self, node: Hashable) -> list[Hashable]:
+        """Get all neighbors (predecessors + successors) of a node.
+
+        Args:
+            node: The node identifier.
+
+        Returns:
+            List of unique neighbor node identifiers.
+
+        Raises:
+            KeyError: If node doesn't exist.
+        """
+        return list(set(self.predecessors(node)) | set(self.successors(node)))
+
+    def out_degree(self, node: Hashable) -> int:
+        """Get the number of outgoing edges from a node.
+
+        Args:
+            node: The node identifier.
+
+        Returns:
+            Number of outgoing edges.
+
+        Raises:
+            KeyError: If node doesn't exist.
+        """
+        if node not in self._node_to_idx:
+            raise KeyError(f"Node '{node}' not found in graph")
+        idx = self._node_to_idx[node]
+        return len(list(self._graph.successor_indices(idx)))
+
+    def in_degree(self, node: Hashable) -> int:
+        """Get the number of incoming edges to a node.
+
+        Args:
+            node: The node identifier.
+
+        Returns:
+            Number of incoming edges.
+
+        Raises:
+            KeyError: If node doesn't exist.
+        """
+        if node not in self._node_to_idx:
+            raise KeyError(f"Node '{node}' not found in graph")
+        idx = self._node_to_idx[node]
+        return len(list(self._graph.predecessor_indices(idx)))
+
+    def degree(self, node: Hashable) -> int:
+        """Get the total degree (in + out) of a node.
+
+        Args:
+            node: The node identifier.
+
+        Returns:
+            Total number of edges incident to the node.
+
+        Raises:
+            KeyError: If node doesn't exist.
+        """
+        return self.in_degree(node) + self.out_degree(node)
+
+    # --- Graph Algorithms ---
+
+    def is_dag(self) -> bool:
+        """Check if the graph is a directed acyclic graph (DAG).
+
+        Returns:
+            True if the graph has no cycles, False otherwise.
+        """
+        return rustworkx.is_directed_acyclic_graph(self._graph)
+
+    def topological_sort(self) -> list[Hashable]:
+        """Return nodes in topological order.
+
+        Only valid for directed acyclic graphs (DAGs).
+
+        Returns:
+            List of node identifiers in topological order.
+
+        Raises:
+            ValueError: If the graph contains cycles.
+        """
+        if not self.is_dag():
+            raise ValueError("Cannot perform topological sort: graph contains cycles")
+        indices = rustworkx.topological_sort(self._graph)
+        return [self._idx_to_node[idx] for idx in indices]
+
+    def has_path(self, source: Hashable, target: Hashable) -> bool:
+        """Check if a path exists from source to target.
+
+        Args:
+            source: Source node identifier.
+            target: Target node identifier.
+
+        Returns:
+            True if a path exists, False otherwise.
+            Returns False if either node doesn't exist.
+        """
+        if source not in self._node_to_idx or target not in self._node_to_idx:
+            return False
+        return rustworkx.has_path(
+            self._graph,
+            self._node_to_idx[source],
+            self._node_to_idx[target],
+        )
+
+    def shortest_path(
+        self, source: Hashable, target: Hashable
+    ) -> list[Hashable] | None:
+        """Find the shortest path from source to target.
+
+        Uses BFS to find the path with minimum number of edges.
+
+        Args:
+            source: Source node identifier.
+            target: Target node identifier.
+
+        Returns:
+            List of node identifiers forming the path (including source and target),
+            or None if no path exists.
+
+        Raises:
+            KeyError: If source or target node doesn't exist.
+        """
+        if source not in self._node_to_idx:
+            raise KeyError(f"Source node '{source}' not found in graph")
+        if target not in self._node_to_idx:
+            raise KeyError(f"Target node '{target}' not found in graph")
+
+        src_idx = self._node_to_idx[source]
+        tgt_idx = self._node_to_idx[target]
+
+        try:
+            path_indices = rustworkx.dijkstra_shortest_paths(
+                self._graph, src_idx, tgt_idx, weight_fn=lambda _: 1.0
+            )
+            if tgt_idx not in path_indices:
+                return None
+            return [self._idx_to_node[idx] for idx in path_indices[tgt_idx]]
+        except Exception:
+            return None
+
     # --- Sync Operations ---
 
     def sync(self) -> None:
@@ -434,9 +648,7 @@ class Graph:
 
     def edges(self) -> list[tuple[Hashable, Hashable]]:
         """Get all edges as (source, target) tuples."""
-        result = []
-        for src_idx, tgt_idx in self._graph.edge_list():
-            src_data = self._graph[src_idx]
-            tgt_data = self._graph[tgt_idx]
-            result.append((src_data["node"], tgt_data["node"]))
-        return result
+        return [
+            (self._idx_to_node[src_idx], self._idx_to_node[tgt_idx])
+            for src_idx, tgt_idx in self._graph.edge_list()
+        ]

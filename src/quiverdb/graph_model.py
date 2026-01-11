@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import types
 import warnings
 from typing import (
     TYPE_CHECKING,
@@ -98,9 +99,15 @@ def _validate_no_new_fields(cls: type[SQLModel], table_base: type[SQLModel]) -> 
 
 
 def _is_optional_annotation(annotation: Any) -> bool:
-    """Check if annotation is Optional (Union with None)."""
+    """Check if annotation is Optional (Union with None).
+
+    Handles both typing.Union[X, None] and PEP 604 X | None syntax.
+    """
     origin = get_origin(annotation)
     if origin is Union:
+        return type(None) in get_args(annotation)
+    # Handle PEP 604 syntax: str | None creates types.UnionType
+    if isinstance(annotation, types.UnionType):
         return type(None) in get_args(annotation)
     return False
 
@@ -289,6 +296,9 @@ class GraphModelMetaclass(SQLModelMetaclass):
                 if field_name in namespace:
                     continue
                 if _is_optional_annotation(annotation):
+                    # Ensure Optional fields have explicit default=None
+                    # to properly inherit from parent class
+                    namespace[field_name] = Field(default=None)
                     continue
                 namespace[field_name] = Field(...)
 
@@ -459,6 +469,10 @@ class GraphModel(SQLModel, metaclass=GraphModelMetaclass):
         # Find target class based on type
         if type_str and type_str in cls._type_registry:
             target_cls = cls._type_registry[type_str]
+            # Verify target shares same table base - prevent cross-dispatch
+            # between node and edge models
+            if cls._table_base is not None and target_cls._table_base is not cls._table_base:
+                target_cls = cls  # Fall back to calling class
         else:
             target_cls = cls
 

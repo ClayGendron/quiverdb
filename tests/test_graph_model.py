@@ -332,6 +332,43 @@ class TestModelValidate:
 
         assert instance.type is None
 
+    def test_model_validate_prevents_cross_dispatch(self) -> None:
+        """model_validate on NodeModel with edge type falls back to caller."""
+        from .conftest import make_unique_table_name
+
+        # Create separate node and edge models
+        node_table = make_unique_table_name("cross_dispatch_nodes")
+        edge_table = make_unique_table_name("cross_dispatch_edges")
+
+        class CrossNode(GraphModel, table=True, table_name=node_table):
+            node: str = Field(primary_key=True)
+            type: str
+
+        class CrossEdge(GraphModel, table=True, table_name=edge_table):
+            source: str = Field(primary_key=True)
+            target: str = Field(primary_key=True)
+            type: str
+
+        class NodeSubtype(CrossNode):
+            pass
+
+        class EdgeSubtype(CrossEdge):
+            pass
+
+        _test_classes.extend([CrossNode, CrossEdge, NodeSubtype, EdgeSubtype])
+
+        # Calling CrossNode.model_validate with an edge type should NOT
+        # return an edge instance - it should fall back to CrossNode
+        instance = CrossNode.model_validate({
+            "node": "test-node",
+            "type": "EdgeSubtype",  # This is an edge type name!
+        })
+
+        # Should be a CrossNode, not an EdgeSubtype
+        assert isinstance(instance, CrossNode)
+        assert not isinstance(instance, CrossEdge)
+        assert instance.type == "EdgeSubtype"  # Type field preserved
+
 
 class TestGraphTypeDecorator:
     """Tests for @graph_type decorator custom naming."""

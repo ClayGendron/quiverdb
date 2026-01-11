@@ -15,31 +15,35 @@ class ChangeTracker:
     - Updating an existing node: overwrites previous entry in _node_upserts
     - Deleting a node: removes from _node_upserts (if pending), adds to _node_deletes
     - Re-adding a deleted node: removes from _node_deletes, adds to _node_upserts
+
+    Note: Node and edge keys are stored as their original Hashable types.
+    Different types with the same string representation (e.g., int(1) vs str("1"))
+    are treated as distinct keys.
     """
-    node_upserts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    edge_upserts: Dict[tuple, Dict[str, Any]] = field(default_factory=dict)
-    node_deletes: Set[str] = field(default_factory=set)
-    edge_deletes: Set[tuple] = field(default_factory=set)
+    node_upserts: Dict[Hashable, Dict[str, Any]] = field(default_factory=dict)
+    edge_upserts: Dict[tuple[Hashable, Hashable], Dict[str, Any]] = field(default_factory=dict)
+    node_deletes: Set[Hashable] = field(default_factory=set)
+    edge_deletes: Set[tuple[Hashable, Hashable]] = field(default_factory=set)
 
     def track_node_upsert(self, node: Hashable, data: Dict[str, Any]) -> None:
-        """Track a node insert or update"""
-        self.node_deletes.discard(str(node))
-        self.node_upserts[str(node)] = data
+        """Track a node insert or update."""
+        self.node_deletes.discard(node)
+        self.node_upserts[node] = data
 
     def track_node_delete(self, node: Hashable) -> None:
-        """Track a node deletion"""
-        self.node_upserts.pop(str(node), None)
-        self.node_deletes.add(str(node))
+        """Track a node deletion."""
+        self.node_upserts.pop(node, None)
+        self.node_deletes.add(node)
 
     def track_edge_upsert(self, source: Hashable, target: Hashable, data: Dict[str, Any]) -> None:
-        """Track an edge insert or update"""
-        key = (str(source), str(target))
+        """Track an edge insert or update."""
+        key = (source, target)
         self.edge_deletes.discard(key)
         self.edge_upserts[key] = data
 
     def track_edge_delete(self, source: Hashable, target: Hashable) -> None:
-        """Track an edge deletion"""
-        key = (str(source), str(target))
+        """Track an edge deletion."""
+        key = (source, target)
         self.edge_upserts.pop(key, None)
         self.edge_deletes.add(key)
 

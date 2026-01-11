@@ -39,6 +39,7 @@ from typing import (
 from pydantic import EmailStr as PydanticEmailStr
 from pydantic import GetCoreSchemaHandler
 from pydantic import HttpUrl as PydanticHttpUrl
+from pydantic import validate_email
 from pydantic_core import CoreSchema, core_schema
 
 # ============ SCHEMA UTILITIES ============
@@ -331,7 +332,7 @@ class Email:
         )
 
     def _validate(self, v: str) -> str:
-        PydanticEmailStr._validate(v)
+        validate_email(v)
         return v
 
 
