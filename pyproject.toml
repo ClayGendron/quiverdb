@@ -23,6 +23,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "email-validator>=2.0",
     "pydantic>=2.0",
     "rustworkx>=0.17",
     "sqlalchemy>=2.0",
