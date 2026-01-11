@@ -174,34 +174,108 @@ class TestSubclassFieldValidation:
                 new_field: str  # not on base table
 
 
-class TestFromDict:
-    """Tests for from_dict type detection and instantiation."""
+class TestAutoTypeField:
+    """Tests for automatic type field setting in subclass instantiation."""
 
-    def test_from_dict_detects_type(self) -> None:
-        """from_dict uses 'type' field to find the right subclass."""
+    def test_subclass_auto_sets_type_field(self) -> None:
+        """Instantiating a type subclass auto-sets the type field."""
 
-        class DictNode(GraphModel, table=True, table_name="dict_nodes"):
+        class AutoNode(GraphModel, table=True, table_name="auto_nodes"):
+            node: str = Field(primary_key=True)
+            type: str
+            name: str | None = None
+
+        class AutoDocument(AutoNode):
+            name: str
+
+        _test_classes.extend([AutoNode, AutoDocument])
+
+        doc = AutoDocument(node="doc-1", name="Report")
+        assert doc.type == "AutoDocument"
+
+    def test_direct_instantiation_follows_sqlmodel_behavior(self) -> None:
+        """Direct instantiation doesn't validate (SQLModel table behavior).
+
+        Use model_validate() for validation. Direct instantiation of table
+        classes bypasses Pydantic validation - this is standard SQLModel behavior.
+        """
+
+        class DirectNode(GraphModel, table=True, table_name="direct_nodes"):
+            node: str = Field(primary_key=True)
+            type: str
+            name: str | None = None
+
+        class DirectStrictDoc(DirectNode):
+            name: str  # required in schema, but direct instantiation won't validate
+
+        _test_classes.extend([DirectNode, DirectStrictDoc])
+
+        # Direct instantiation doesn't raise - this is SQLModel behavior
+        doc = DirectStrictDoc(node="doc-1")  # missing name, but no validation
+        assert doc.type == "DirectStrictDoc"
+        assert doc.name is None  # field is missing, defaulted to None
+
+    def test_subclass_explicit_type_preserved(self) -> None:
+        """Explicit type value is preserved when provided."""
+
+        class ExplicitNode(GraphModel, table=True, table_name="explicit_nodes"):
+            node: str = Field(primary_key=True)
+            type: str
+            name: str | None = None
+
+        class Report(ExplicitNode):
+            name: str
+
+        _test_classes.extend([ExplicitNode, Report])
+
+        # Explicit type should be preserved
+        doc = Report(node="doc-1", name="Test", type="CustomType")
+        assert doc.type == "CustomType"
+
+    def test_custom_type_name_decorator_auto_sets(self) -> None:
+        """@graph_type decorator name is used for auto-set type field."""
+
+        class DecNode(GraphModel, table=True, table_name="dec_nodes"):
+            node: str = Field(primary_key=True)
+            type: str
+
+        @graph_type("MyCustomType")
+        class CustomDoc(DecNode):
+            pass
+
+        _test_classes.extend([DecNode, CustomDoc])
+
+        doc = CustomDoc(node="doc-1")
+        assert doc.type == "MyCustomType"
+
+
+class TestModelValidate:
+    """Tests for model_validate type detection and instantiation."""
+
+    def test_model_validate_detects_type(self) -> None:
+        """model_validate uses 'type' field to find the right subclass."""
+
+        class ValidateNode(GraphModel, table=True, table_name="validate_nodes"):
             node: str = Field(primary_key=True)
             type: str
             title: str | None = None
 
-        class Article(DictNode):
+        class Paper(ValidateNode):
             title: str
 
-        _test_classes.extend([DictNode, Article])
+        _test_classes.extend([ValidateNode, Paper])
 
-        instance = DictNode.from_dict({
-            "node": "article-1",
-            "type": "Article",
-            "title": "My Article",
+        instance = ValidateNode.model_validate({
+            "node": "paper-1",
+            "type": "Paper",
+            "title": "My Paper",
         })
 
-        # Should validate against Article schema
-        assert instance.type == "Article"
-        assert instance.title == "My Article"
+        assert instance.type == "Paper"
+        assert instance.title == "My Paper"
 
-    def test_from_dict_validates_required_fields(self) -> None:
-        """from_dict raises if required fields for the type are missing."""
+    def test_model_validate_validates_required_fields(self) -> None:
+        """model_validate raises if required fields for the type are missing."""
         from pydantic import ValidationError
 
         class ValidNode(GraphModel, table=True, table_name="valid_nodes"):
@@ -215,14 +289,14 @@ class TestFromDict:
         _test_classes.extend([ValidNode, Person])
 
         with pytest.raises(ValidationError):
-            ValidNode.from_dict({
+            ValidNode.model_validate({
                 "node": "person-1",
                 "type": "Person",
                 # missing email
             })
 
-    def test_from_dict_falls_back_to_base(self) -> None:
-        """from_dict uses base class if type not in registry."""
+    def test_model_validate_falls_back_to_base(self) -> None:
+        """model_validate uses base class if type not in registry."""
 
         class FallbackNode(GraphModel, table=True, table_name="fallback_nodes"):
             node: str = Field(primary_key=True)
@@ -230,33 +304,27 @@ class TestFromDict:
 
         _test_classes.append(FallbackNode)
 
-        instance = FallbackNode.from_dict({
+        instance = FallbackNode.model_validate({
             "node": "unknown-1",
             "type": "UnknownType",
         })
 
         assert instance.type == "UnknownType"
 
-    def test_from_dict_auto_sets_type(self) -> None:
-        """from_dict auto-sets type field if not provided."""
+    def test_model_validate_leaves_type_unset_for_base(self) -> None:
+        """model_validate does NOT auto-set type when called on base class."""
 
-        class AutoTypeNode(GraphModel, table=True, table_name="auto_type_nodes"):
+        class BaseTypeNode(GraphModel, table=True, table_name="base_type_nodes"):
             node: str = Field(primary_key=True)
-            type: str
-            name: str | None = None
+            type: str | None = None
 
-        class Widget(AutoTypeNode):
-            name: str
+        _test_classes.append(BaseTypeNode)
 
-        _test_classes.extend([AutoTypeNode, Widget])
-
-        # Register Widget, then create via from_dict without explicit type
-        # Since we can't auto-detect without type field, this tests the base case
-        instance = AutoTypeNode.from_dict({
-            "node": "widget-1",
+        instance = BaseTypeNode.model_validate({
+            "node": "node-1",
         })
 
-        assert instance.type == "AutoTypeNode"
+        assert instance.type is None
 
 
 class TestGraphTypeDecorator:
@@ -278,8 +346,8 @@ class TestGraphTypeDecorator:
         assert "CustomPersonType" in GraphModel._type_registry
         assert "PersonWithCustomName" not in GraphModel._type_registry
 
-    def test_from_dict_uses_custom_type_name(self) -> None:
-        """from_dict recognizes custom type names from decorator."""
+    def test_model_validate_uses_custom_type_name(self) -> None:
+        """model_validate recognizes custom type names from decorator."""
 
         class CustomNode(GraphModel, table=True, table_name="custom_type_nodes"):
             node: str = Field(primary_key=True)
@@ -292,7 +360,7 @@ class TestGraphTypeDecorator:
 
         _test_classes.extend([CustomNode, Admin])
 
-        instance = CustomNode.from_dict({
+        instance = CustomNode.model_validate({
             "node": "admin-1",
             "type": "AdminUser",
             "role": "superuser",
@@ -323,3 +391,44 @@ class TestGetRegisteredTypes:
         registered = GraphModel.get_registered_types()
         assert "TypeA" in registered
         assert "TypeB" in registered
+
+
+class TestDuplicateTypeDetection:
+    """Tests for duplicate type name detection."""
+
+    def test_duplicate_type_name_raises_error(self) -> None:
+        """Registering the same type name twice raises TypeError."""
+
+        class DupNode(GraphModel, table=True, table_name="dup_nodes"):
+            node: str = Field(primary_key=True)
+            type: str
+
+        class UniqueType(DupNode):
+            pass
+
+        _test_classes.extend([DupNode, UniqueType])
+
+        # Attempting to register another class with same name should fail
+        with pytest.raises(TypeError, match="already registered"):
+
+            class UniqueType(DupNode):  # noqa: F811 - intentional redefinition
+                pass
+
+    def test_graph_type_decorator_duplicate_raises_error(self) -> None:
+        """@graph_type with existing name raises TypeError."""
+
+        class DecDupNode(GraphModel, table=True, table_name="dec_dup_nodes"):
+            node: str = Field(primary_key=True)
+            type: str
+
+        class FirstType(DecDupNode):
+            pass
+
+        _test_classes.extend([DecDupNode, FirstType])
+
+        # Trying to use @graph_type with an existing name should fail
+        with pytest.raises(TypeError, match="already registered"):
+
+            @graph_type("FirstType")
+            class SecondType(DecDupNode):
+                pass

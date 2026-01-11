@@ -1,9 +1,9 @@
-"""GraphModel - SQLModel extension for graph-structured data."""
+"""GraphModel - SQLModel extension for graph data with polymorphic inheritance."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from contextvars import ContextVar
+import contextlib
+import warnings
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -15,28 +15,18 @@ from typing import (
     get_origin,
 )
 
+from sqlalchemy import event
+from sqlalchemy.orm import ORMExecuteState, Session
 from sqlmodel import Field, SQLModel
 from sqlmodel.main import SQLModelMetaclass
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable
 
-# ============ CONTEXT VARIABLES ============
-
-_graph_init: ContextVar[bool] = ContextVar("graph_init", default=True)
-
-
-@contextmanager
-def partial_graph_init() -> Generator[None, None, None]:
-    """Skip full graph validation during ORM reconstruction."""
-    token = _graph_init.set(False)
-    try:
-        yield
-    finally:
-        _graph_init.reset(token)
-
+    from sqlalchemy.sql import Select
 
 # ============ RESERVED NAMES ============
+
 
 def _get_reserved_field_names() -> frozenset[str]:
     """Get field names reserved by SQLModel."""
@@ -51,6 +41,7 @@ RESERVED_FIELD_NAMES = _get_reserved_field_names()
 
 
 # ============ HELPERS ============
+
 
 def _is_table_model(cls: type[SQLModel]) -> bool:
     """Check if class is a SQLModel table."""
@@ -75,7 +66,6 @@ def _detect_model_type(cls: type) -> Literal["node", "edge"]:
         if hasattr(base, "__annotations__"):
             fields.update(base.__annotations__.keys())
 
-    # Node detection takes precedence
     if "node" in fields:
         return "node"
 
@@ -129,26 +119,142 @@ def _parent_is_table(bases: tuple[type, ...]) -> bool:
     return False
 
 
+def _has_type_field(cls: type) -> bool:
+    """Check if class has a 'type' field in its annotations."""
+    for base in cls.__mro__:
+        if hasattr(base, "__annotations__") and "type" in base.__annotations__:
+            return True
+    return False
+
+
+def _get_polymorphic_entity(stmt: Any) -> tuple[Any, Any]:
+    """Extract polymorphic subclass entity from a select statement."""
+    # Check column_descriptions (covers select(Entity))
+    for desc in stmt.column_descriptions:
+        entity = desc.get("entity")
+        if entity and hasattr(entity, "__mapper__"):
+            mapper = entity.__mapper__
+            if mapper.inherits and mapper.polymorphic_identity:
+                return entity, mapper
+
+    # Check froms (covers select_from(Entity))
+    if hasattr(stmt, "froms"):
+        for frm in stmt.froms:
+            if hasattr(frm, "entity_namespace"):
+                entity = frm.entity_namespace
+                if hasattr(entity, "__mapper__"):
+                    mapper = entity.__mapper__
+                    if mapper.inherits and mapper.polymorphic_identity:
+                        return entity, mapper
+
+    return None, None
+
+
+# ============ EVENT LISTENER ============
+
+_event_listener_registered = False
+
+
+def _register_polymorphic_event_listener() -> None:
+    """Register SQLAlchemy event listener for auto-filtering polymorphic queries.
+
+    When you query `select(Document)`, this automatically adds
+    `WHERE type = 'Document'` to filter by the polymorphic identity.
+    """
+    global _event_listener_registered
+    if _event_listener_registered:
+        return
+    _event_listener_registered = True
+
+    @event.listens_for(Session, "do_orm_execute")
+    def _add_polymorphic_filter(orm_execute_state: ORMExecuteState) -> None:
+        if not orm_execute_state.is_select:
+            return
+
+        stmt = orm_execute_state.statement
+        entity, mapper = _get_polymorphic_entity(stmt)
+
+        if entity and mapper:
+            select_stmt = cast("Select[Any]", stmt)
+            new_stmt = select_stmt.where(
+                mapper.polymorphic_on == mapper.polymorphic_identity
+            )
+            orm_execute_state.statement = new_stmt
+
+
+# Register on module load
+_register_polymorphic_event_listener()
+
+
 # ============ DECORATOR ============
 
+
 def graph_type(name: str) -> Callable[[type[GraphModel]], type[GraphModel]]:
-    """Decorator to set a custom type name for registry."""
+    """Set a custom type name for a GraphModel subclass.
+
+    This decorator must be applied at class definition time. SQLAlchemy's
+    polymorphic identity cannot be changed after the mapper is configured.
+
+    The custom name affects:
+    - The type registry (for model_validate dispatch)
+    - The polymorphic identity (for SELECT auto-filtering)
+    - The auto-set 'type' field value on instantiation
+
+    Usage:
+        @graph_type("CustomName")
+        class MyDocument(Node):
+            pass
+
+        doc = MyDocument(node="1")
+        assert doc.type == "CustomName"
+
+    Raises:
+        TypeError: If applied to a non-subclass or if name is already registered.
+    """
+
     def decorator(cls: type[GraphModel]) -> type[GraphModel]:
-        # Remove old registration (class name)
         old_name = cls.__name__
+        table_base = cls._table_base
+
+        # Validate this is a proper type subclass
+        if table_base is None:
+            raise TypeError(
+                f"@graph_type can only be applied to subclasses of a table class, "
+                f"not to '{cls.__name__}'."
+            )
+
+        # Check for duplicate names (but allow if it's the same class being renamed)
+        if name in GraphModel._type_registry:
+            existing_cls = GraphModel._type_registry[name]
+            if existing_cls is not cls:
+                raise TypeError(
+                    f"Type name '{name}' is already registered by "
+                    f"'{existing_cls.__name__}'."
+                )
+
+        # Update type registry: remove old name, add new name
         if old_name in GraphModel._type_registry:
             del GraphModel._type_registry[old_name]
-        # Set custom name and re-register
         cls._type_name = name
         GraphModel._type_registry[name] = cls
+
         return cls
+
     return decorator
 
 
 # ============ METACLASS ============
 
+
 class GraphModelMetaclass(SQLModelMetaclass):
-    """Metaclass that extends SQLModel with graph-specific behavior."""
+    """Metaclass that extends SQLModel with graph-specific behavior.
+
+    Key features:
+    - Auto-detects node vs edge models based on field names
+    - Sets up SQLAlchemy polymorphic inheritance for type subclasses
+    - Auto-configures __mapper_args__ for tables with 'type' field
+    - Registers type subclasses for select() auto-filtering
+    """
 
     def __new__(
         mcs,
@@ -158,49 +264,48 @@ class GraphModelMetaclass(SQLModelMetaclass):
         table_name: str | None = None,
         **kwargs: Any,
     ) -> type:
-        # Check if this will be a table class
         is_table = kwargs.get("table", False)
+        is_type_subclass = not is_table and _parent_is_table(bases)
 
         # Set __tablename__ before SQLModel processes the class
         if is_table:
             if table_name:
                 namespace["__tablename__"] = table_name
             elif "__tablename__" not in namespace:
-                # Auto-detect default table name based on fields
                 annotations = namespace.get("__annotations__", {})
                 if "node" in annotations:
                     namespace["__tablename__"] = "nodes"
                 elif "source" in annotations and "target" in annotations:
                     namespace["__tablename__"] = "edges"
 
-        # For non-table subclasses of table classes, fix SQLModel/Pydantic integration
-        # Issue: Subclasses inherit model_config["table"]=True from parent, causing
-        # SQLAlchemy instrumentation issues. Also, parent's InstrumentedAttribute
-        # becomes the default, making required fields appear optional.
-        if not is_table and _parent_is_table(bases):
-            # Explicitly mark as non-table to avoid SQLAlchemy instrumentation
-            if "model_config" not in namespace:
-                namespace["model_config"] = {}
-            namespace["model_config"]["table"] = False
+            # Auto-configure __mapper_args__ for polymorphic inheritance
+            # if the table has a 'type' field
+            annotations = namespace.get("__annotations__", {})
+            if "type" in annotations and "__mapper_args__" not in namespace:
+                namespace["__mapper_args__"] = {
+                    "polymorphic_on": "type",
+                    "polymorphic_identity": name,
+                }
 
-            # For any field with non-Optional annotation and no default value,
-            # add Field(...) to properly mark it as required
+        # For type subclasses, mark required fields properly
+        if is_type_subclass:
             annotations = namespace.get("__annotations__", {})
             for field_name, annotation in annotations.items():
                 if field_name in namespace:
-                    continue  # Already has a value/default
+                    continue
                 if _is_optional_annotation(annotation):
-                    continue  # Optional fields don't need explicit required marker
+                    continue
                 namespace[field_name] = Field(...)
 
         # Let SQLModel's metaclass create the class
-        new_cls = super().__new__(mcs, name, bases, namespace, **kwargs)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Field name .* shadows")
+            new_cls = super().__new__(mcs, name, bases, namespace, **kwargs)
 
         # Skip setup for the base GraphModel class itself
         if name == "GraphModel" and bases == (SQLModel,):
             return new_cls
 
-        # Validate reserved field names
         _validate_reserved_field_names(new_cls)
 
         # Detect model type (node vs edge)
@@ -208,45 +313,68 @@ class GraphModelMetaclass(SQLModelMetaclass):
             new_cls.model_type = _detect_model_type(new_cls)
         except TypeError:
             if is_table:
-                # Table classes MUST have node or source/target fields
                 raise
             # Skip for non-table classes without required fields
 
         if is_table:
-            # This is a table class - mark it as the base
             new_cls._table_base = new_cls
         else:
-            # This is a type subclass - inherit table base from parent
             parent_base = _get_table_base(new_cls)
             new_cls._table_base = parent_base
 
             if parent_base is not None:
-                # Validate no new fields introduced
-                _validate_no_new_fields(
-                    cast("type[SQLModel]", new_cls), parent_base
-                )
+                _validate_no_new_fields(cast("type[SQLModel]", new_cls), parent_base)
 
-                # Register in type registry (on GraphModel class)
+                # Get the type name (respects @graph_type decorator)
                 type_name = getattr(new_cls, "_type_name", None) or name
-                # Access registry through the GraphModel base class
-                for base in new_cls.__mro__:
-                    is_graph_model = base.__name__ == "GraphModel"
-                    if is_graph_model and hasattr(base, "_type_registry"):
-                        base._type_registry[type_name] = new_cls
-                        break
+
+                # Check for duplicate type names
+                if type_name in GraphModel._type_registry:
+                    existing_cls = GraphModel._type_registry[type_name]
+                    raise TypeError(
+                        f"Type name '{type_name}' is already registered by "
+                        f"'{existing_cls.__name__}'. Use @graph_type('UniqueName') "
+                        f"to set a different type name for '{name}'."
+                    )
+
+                # Register in type registry
+                GraphModel._type_registry[type_name] = new_cls
+
+                # Register with SQLAlchemy for polymorphic inheritance
+                if _has_type_field(parent_base):
+                    _register_polymorphic_subclass(new_cls, parent_base, type_name)
 
         return new_cls
 
 
+def _register_polymorphic_subclass(
+    cls: type, table_base: type[SQLModel], type_name: str
+) -> None:
+    """Register a type subclass with SQLAlchemy's polymorphic mapper."""
+    # Suppress exceptions - class may already be mapped in test environments
+    with contextlib.suppress(Exception):
+        # Runtime attributes added by SQLAlchemy, not in type stubs
+        registry = SQLModel._sa_registry  # type: ignore[attr-defined]
+        table = table_base.__table__  # type: ignore[attr-defined]
+        registry.map_imperatively(
+            cls,
+            table,
+            inherits=table_base,
+            polymorphic_identity=type_name,
+        )
+
+
 # ============ GRAPHMODEL ============
 
+
 class GraphModel(SQLModel, metaclass=GraphModelMetaclass):
-    """SQLModel extension for graph-structured data.
+    """SQLModel extension for graph-structured data with polymorphic inheritance.
 
     Provides:
     - Automatic node/edge detection based on fields
-    - Type registry for subclass validation
-    - from_dict() for type-aware instantiation
+    - Polymorphic inheritance: `select(Document)` auto-filters by type
+    - Type registry for validation dispatch
+    - Auto-set type field on subclass instantiation
 
     Node models must have a 'node' field.
     Edge models must have 'source' and 'target' fields.
@@ -255,12 +383,21 @@ class GraphModel(SQLModel, metaclass=GraphModelMetaclass):
         class Node(GraphModel, table=True):
             node: str = Field(primary_key=True)
             type: str
+            name: str | None = None
 
-        class Person(Node):
-            pass  # Registered as type "Person"
+        class Document(Node):
+            name: str  # Make name required for documents
+
+        # Create instances - type is auto-set
+        doc = Document(node="doc-1", name="Report")
+        assert doc.type == "Document"
+
+        # Query with auto-filtering
+        with Session(engine) as session:
+            # Automatically adds WHERE type = 'Document'
+            docs = session.exec(select(Document)).all()
     """
 
-    # Class variables with explicit typing
     model_type: ClassVar[Literal["node", "edge"]]
     _table_base: ClassVar[type[GraphModel] | None]
     _type_name: ClassVar[str | None]
@@ -268,7 +405,20 @@ class GraphModel(SQLModel, metaclass=GraphModelMetaclass):
 
     _table_base = None
     _type_name = None
-    _type_registry = {}  # Regular dict - caller must maintain references
+    _type_registry = {}
+
+    def __init__(self, **data: Any) -> None:
+        """Initialize GraphModel instance.
+
+        For type subclasses, automatically sets the 'type' field
+        to the class name (or @graph_type name) if not provided.
+        """
+        # Auto-set type for subclasses
+        table_base = self.__class__._table_base
+        if table_base is not None and table_base is not self.__class__:
+            data.setdefault("type", self.__class__.get_type_name())
+
+        super().__init__(**data)
 
     @classmethod
     def get_type_name(cls) -> str:
@@ -276,85 +426,58 @@ class GraphModel(SQLModel, metaclass=GraphModelMetaclass):
         return cls._type_name or cls.__name__
 
     @classmethod
-    def from_dict(
+    def model_validate(  # type: ignore[override]
         cls,
-        data: dict[str, Any],
+        obj: Any,
         *,
-        strict: bool = True,
+        strict: bool | None = None,
+        from_attributes: bool | None = None,
+        context: dict[str, Any] | None = None,
+        update: dict[str, Any] | None = None,
     ) -> GraphModel:
-        """Create instance from dict, auto-detecting type.
+        """Validate and create instance with type-aware dispatch.
 
-        If 'type' key is present and matches a registered subclass,
-        validates against that subclass's schema.
+        If 'type' key matches a registered subclass, dispatches to that
+        class for validation. Delegates to SQLModel's validation to ensure
+        proper Pydantic handling.
 
         Args:
-            data: Dictionary of field values.
-            strict: If True, raise on validation failure. If False, fall back to base.
+            obj: Data to validate (dict or object with attributes).
+            strict: Whether to enforce strict validation.
+            from_attributes: Whether to extract data from object attributes.
+            context: Additional context for validation.
+            update: Additional fields to update/override.
 
         Returns:
-            Instance of the appropriate GraphModel subclass.
+            Instance of the appropriate type class.
 
         Raises:
-            ValidationError: If required fields are missing for the detected type.
+            ValidationError: If validation fails.
         """
-        type_str = data.get("type")
+        # Determine type for dispatch
+        if isinstance(obj, dict):
+            merged = {**obj, **(update or {})}
+            type_str = merged.get("type")
+        else:
+            type_str = getattr(obj, "type", None)
 
-        # Find the target class for validation
-        target_cls: type[GraphModel]
+        # Find target class based on type
         if type_str and type_str in cls._type_registry:
             target_cls = cls._type_registry[type_str]
         else:
             target_cls = cls
 
-        # Get the table base for instantiation
-        table_base = target_cls._table_base or target_cls
-        table_fields = set(table_base.model_fields.keys())
-
-        # Separate table fields from extras
-        table_data: dict[str, Any] = {}
-        extra_data: dict[str, Any] = {}
-
-        for key, value in data.items():
-            if key in table_fields:
-                table_data[key] = value
-            else:
-                extra_data[key] = value
-
-        # Store extras in properties if that field exists
-        if extra_data and "properties" in table_fields:
-            existing_props = table_data.get("properties", {})
-            if isinstance(existing_props, dict):
-                table_data["properties"] = {**existing_props, **extra_data}
-            else:
-                table_data["properties"] = extra_data
-
-        # Auto-set type field if not provided
-        if "type" in table_fields and "type" not in table_data:
-            table_data["type"] = target_cls.get_type_name()
-
-        # Build validation data (table fields + expanded properties)
-        validation_data = {**table_data}
-        if "properties" in table_data and isinstance(table_data["properties"], dict):
-            validation_data.update(table_data["properties"])
-
-        # Validate against target class schema if it's a subclass
-        # This validates required fields, types, etc. per the subclass rules.
-        # The result is discarded - we only use the table base for instantiation.
-        if target_cls is not table_base:
-            target_cls.__pydantic_validator__.validate_python(validation_data)
-
-        # Create and return base table instance
-        return table_base(**table_data)
+        # Delegate to SQLModel's model_validate for proper Pydantic handling
+        return SQLModel.model_validate.__func__(
+            target_cls,
+            obj,
+            strict=strict,
+            from_attributes=from_attributes,
+            context=context,
+            update=update,
+        )
 
     @classmethod
     def get_registered_types(cls) -> dict[str, type[GraphModel]]:
         """Get all registered type subclasses."""
         return dict(cls._type_registry)
-
-    def __init__(self, **data: Any) -> None:
-        """Initialize with optional graph validation."""
-        if _graph_init.get():
-            super().__init__(**data)
-        else:
-            # Partial init for ORM reconstruction
-            super().__init__(**data)
